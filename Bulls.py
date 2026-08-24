@@ -21,6 +21,8 @@ from dotenv import load_dotenv
 IST = ZoneInfo("Asia/Kolkata")
 INSTRUMENT_URL = "https://images.dhan.co/api-data/api-scrip-master-detailed.csv"
 INTRADAY_URL = "https://api.dhan.co/v2/charts/intraday"
+REQUEST_DELAY_SECONDS = 1.0
+MAX_RATE_LIMIT_RETRIES = 3
 
 load_dotenv()
 
@@ -35,6 +37,7 @@ if not CLIENT_ID or not ACCESS_TOKEN:
 HEADERS = {
     "Accept": "application/json",
     "Content-Type": "application/json",
+    "client-id": CLIENT_ID,
     "access-token": ACCESS_TOKEN,
 }
 
@@ -108,12 +111,18 @@ def get_first_5m_candle(security_id, scan_date):
         "toDate": end,
     }
 
-    r = requests.post(
-        INTRADAY_URL,
-        headers=HEADERS,
-        json=payload,
-        timeout=15,
-    )
+    for retry_number in range(MAX_RATE_LIMIT_RETRIES + 1):
+        r = requests.post(
+            INTRADAY_URL,
+            headers=HEADERS,
+            json=payload,
+            timeout=15,
+        )
+
+        if r.status_code != 429 or retry_number == MAX_RATE_LIMIT_RETRIES:
+            break
+
+        time.sleep(2 ** retry_number)
 
     if r.status_code != 200:
         raise RuntimeError(f"HTTP {r.status_code}: {r.text[:500]}")
@@ -199,8 +208,8 @@ def scan(scan_date):
                 {"Symbol": symbol, "Security ID": security_id, "Error": str(exc)}
             )
 
-        # Stay comfortably below Dhan's data-API request rate limit.
-        time.sleep(0.22)
+        # Stay below Dhan's data-API request rate limit.
+        time.sleep(REQUEST_DELAY_SECONDS)
 
         if (i + 1) % 25 == 0:
             print(f"Processed {i + 1}/{len(universe)}...")
@@ -251,7 +260,7 @@ def main():
     else:
         scan_date = datetime.now(IST).strftime("%Y-%m-%d")
 
-    if not is_market_hours():
+    if not args.date and not is_market_hours():
         print("Outside allowed NSE hours (09:15-15:30 IST). Exiting.")
         return
 
