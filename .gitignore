@@ -1,0 +1,6 @@
+.env
+local.settings.json
+.venv-*/
+__pycache__/
+*.pyc
+.azure/deployment-plan.md

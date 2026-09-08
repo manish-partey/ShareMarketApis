@@ -1,0 +1,12 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+    "FUNCTIONS_WORKER_RUNTIME": "python",
+    "DHAN_CLIENT_ID": "",
+    "DHAN_ACCESS_TOKEN": "",
+    "GMAIL_ADDRESS": "",
+    "GMAIL_APP_PASSWORD": "",
+    "ALERT_EMAIL_TO": ""
+  }
+}

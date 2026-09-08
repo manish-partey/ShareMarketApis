@@ -379,12 +379,15 @@ def parse_args():
     return parser.parse_args()
 
 
-def main():
-    args = parse_args()
+def run_scan(symbols="", requested_end_date=None, include_today=False):
     require_credentials()
     today = datetime.now(IST).date()
-    end_date = pd.Timestamp(args.end_date).date() if args.end_date else today
-    if not args.end_date and not args.include_today:
+    end_date = (
+        pd.Timestamp(requested_end_date).date()
+        if requested_end_date
+        else today
+    )
+    if not requested_end_date and not include_today:
         end_date = today - pd.Timedelta(days=1)
     start_date = (pd.Timestamp(end_date) - pd.Timedelta(days=DEFAULT_HISTORY_DAYS)).date()
     if end_date < start_date:
@@ -392,8 +395,12 @@ def main():
 
     session = http_session()
     stocks = get_optionable_stocks(fetch_instrument_master(session))
-    if args.symbols.strip():
-        requested = {item.strip().upper() for item in args.symbols.split(",") if item.strip()}
+    if symbols.strip():
+        requested = {
+            item.strip().upper()
+            for item in symbols.split(",")
+            if item.strip()
+        }
         stocks = stocks[stocks["UNDERLYING_SYMBOL"].isin(requested)].copy()
     if stocks.empty:
         raise SystemExit("No option-eligible stocks found for the selection.")
@@ -430,6 +437,15 @@ def main():
         print(f"Email sent to {ALERT_EMAIL_TO}.")
     except (OSError, smtplib.SMTPException) as exc:
         raise SystemExit(f"Could not send email: {exc}") from exc
+
+
+def main():
+    args = parse_args()
+    run_scan(
+        symbols=args.symbols,
+        requested_end_date=args.end_date,
+        include_today=args.include_today,
+    )
 
 
 if __name__ == "__main__":

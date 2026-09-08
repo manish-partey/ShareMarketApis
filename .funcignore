@@ -1,0 +1,7 @@
+.git/
+.venv-1/
+__pycache__/
+.env
+local.settings.json
+.azure/
+*.pyc
