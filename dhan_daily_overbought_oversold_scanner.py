@@ -5,8 +5,8 @@ import argparse
 import io
 import os
 import smtplib
-import time
-from datetime import datetime
+import time as time_module
+from datetime import datetime, time as dt_time
 from email.message import EmailMessage
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -128,7 +128,7 @@ def get_optionable_stocks(master):
     return stocks
 
 
-def fetch_daily_history(session, security_id, start_date, end_date):
+def fetch_history(session, security_id, start_date, end_date, interval=None):
     payload = {
         "securityId": str(security_id),
         "exchangeSegment": EXCHANGE_SEGMENT,
@@ -137,6 +137,8 @@ def fetch_daily_history(session, security_id, start_date, end_date):
         "fromDate": start_date.isoformat(),
         "toDate": end_date.isoformat(),
     }
+    if interval:
+        payload["interval"] = interval
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
@@ -144,7 +146,7 @@ def fetch_daily_history(session, security_id, start_date, end_date):
             if response.status_code == 429:
                 if attempt == MAX_RETRIES:
                     response.raise_for_status()
-                time.sleep(2 ** (attempt - 1))
+                time_module.sleep(2 ** (attempt - 1))
                 continue
             response.raise_for_status()
             data = response.json()
@@ -177,9 +179,17 @@ def fetch_daily_history(session, security_id, start_date, end_date):
         except requests.RequestException:
             if attempt == MAX_RETRIES:
                 raise
-            time.sleep(attempt)
+            time_module.sleep(attempt)
 
     return pd.DataFrame()
+
+
+def fetch_daily_history(session, security_id, start_date, end_date):
+    return fetch_history(session, security_id, start_date, end_date)
+
+
+def fetch_hourly_history(session, security_id, start_date, end_date):
+    return fetch_history(session, security_id, start_date, end_date, interval="ONE_HOUR")
 
 
 def calculate_rsi(close, period=RSI_PERIOD):
@@ -221,56 +231,335 @@ def condition(value, overbought, oversold):
     return "Neutral"
 
 
-def scan_latest(history, symbol, security_id):
-    if len(history) < max(RSI_PERIOD + STOCH_RSI_PERIOD + STOCH_K_PERIOD + STOCH_D_PERIOD, BOLLINGER_PERIOD):
-        return None
-    row = add_indicators(history).iloc[-1]
-    rsi_condition = condition(row["rsi"], RSI_OVERBOUGHT, RSI_OVERSOLD)
-    stoch_condition = condition(
-        row["stoch_rsi_k"], STOCH_OVERBOUGHT, STOCH_OVERSOLD
-    )
-    if pd.isna(row["close"]):
-        return None
-    if row["close"] >= row["bb_upper"]:
-        bb_condition = "Overbought"
-    elif row["close"] <= row["bb_lower"]:
-        bb_condition = "Oversold"
-    else:
-        bb_condition = "Neutral"
+def evaluate_signal(
+    symbol,
+    security_id,
+    timestamp,
+    current_price,
+    rsi,
+    stoch_rsi_k,
+    bb_lower,
+    bb_middle,
+    bb_upper,
+):
+    triggered_indicators = []
+    overbought_count = 0
+    oversold_count = 0
 
-    conditions = {
-        "RSI": rsi_condition,
-        "Stochastic RSI": stoch_condition,
-        "Bollinger Bands": bb_condition,
-    }
-    overbought_conditions = [name for name, value in conditions.items() if value == "Overbought"]
-    oversold_conditions = [name for name, value in conditions.items() if value == "Oversold"]
-    if len(overbought_conditions) >= 2:
-        overall_signal = "SELL / OVERBOUGHT"
-        triggered = "; ".join(overbought_conditions)
-    elif len(oversold_conditions) >= 2:
-        overall_signal = "BUY / OVERSOLD"
-        triggered = "; ".join(oversold_conditions)
-    else:
+    if pd.notna(rsi):
+        if rsi >= RSI_OVERBOUGHT:
+            triggered_indicators.append("RSI")
+            overbought_count += 1
+        elif rsi <= RSI_OVERSOLD:
+            triggered_indicators.append("RSI")
+            oversold_count += 1
+
+    if pd.notna(stoch_rsi_k):
+        if stoch_rsi_k >= STOCH_OVERBOUGHT:
+            triggered_indicators.append("Stochastic RSI")
+            overbought_count += 1
+        elif stoch_rsi_k <= STOCH_OVERSOLD:
+            triggered_indicators.append("Stochastic RSI")
+            oversold_count += 1
+
+    if pd.notna(current_price):
+        if current_price >= bb_upper:
+            triggered_indicators.append("Bollinger Bands")
+            overbought_count += 1
+        elif current_price <= bb_lower:
+            triggered_indicators.append("Bollinger Bands")
+            oversold_count += 1
+
+    if not triggered_indicators:
         return None
+
+    unique_triggered = []
+    seen = set()
+    for indicator in triggered_indicators:
+        if indicator not in seen:
+            unique_triggered.append(indicator)
+            seen.add(indicator)
+
+    if overbought_count > oversold_count:
+        overall_signal = "OVERBOUGHT"
+    elif oversold_count > overbought_count:
+        overall_signal = "OVERSOLD"
+    elif overbought_count > 0:
+        overall_signal = "OVERBOUGHT"
+    else:
+        overall_signal = "OVERSOLD"
 
     return {
         "symbol": symbol,
         "security_id": security_id,
-        "date": row["timestamp"].date().isoformat(),
-        "current_price": row["close"],
-        "rsi": row["rsi"],
-        "rsi_condition": rsi_condition,
-        "stoch_rsi_k": row["stoch_rsi_k"],
-        "stoch_rsi_d": row["stoch_rsi_d"],
-        "stoch_rsi_condition": stoch_condition,
-        "bb_lower": row["bb_lower"],
-        "bb_middle": row["bb_middle"],
-        "bb_upper": row["bb_upper"],
-        "bollinger_condition": bb_condition,
+        "timestamp": timestamp,
+        "current_price": current_price,
+        "rsi": rsi,
+        "stoch_rsi_k": stoch_rsi_k,
+        "bb_lower": bb_lower,
+        "bb_middle": bb_middle,
+        "bb_upper": bb_upper,
         "overall_signal": overall_signal,
-        "triggered_conditions": triggered,
+        "triggered_indicators": unique_triggered,
     }
+
+
+def scan_latest(history, symbol, security_id):
+    if len(history) < max(RSI_PERIOD + STOCH_RSI_PERIOD + STOCH_K_PERIOD + STOCH_D_PERIOD, BOLLINGER_PERIOD):
+        return None
+    row = add_indicators(history).iloc[-1]
+    signal = evaluate_signal(
+        symbol=symbol,
+        security_id=security_id,
+        timestamp=row["timestamp"],
+        current_price=row["close"],
+        rsi=row["rsi"],
+        stoch_rsi_k=row["stoch_rsi_k"],
+        bb_lower=row["bb_lower"],
+        bb_middle=row["bb_middle"],
+        bb_upper=row["bb_upper"],
+    )
+    if not signal:
+        return None
+
+    if signal["overall_signal"] == "OVERBOUGHT":
+        signal["overall_signal"] = "SELL / OVERBOUGHT"
+    else:
+        signal["overall_signal"] = "BUY / OVERSOLD"
+
+    signal["triggered_conditions"] = "; ".join(signal["triggered_indicators"])
+    signal["date"] = signal["timestamp"].date().isoformat()
+    signal["rsi_condition"] = condition(signal["rsi"], RSI_OVERBOUGHT, RSI_OVERSOLD)
+    signal["stoch_rsi_condition"] = condition(
+        signal["stoch_rsi_k"], STOCH_OVERBOUGHT, STOCH_OVERSOLD
+    )
+    if pd.isna(signal["current_price"]):
+        return None
+    if signal["current_price"] >= signal["bb_upper"]:
+        signal["bollinger_condition"] = "Overbought"
+    elif signal["current_price"] <= signal["bb_lower"]:
+        signal["bollinger_condition"] = "Oversold"
+    else:
+        signal["bollinger_condition"] = "Neutral"
+    signal["stoch_rsi_d"] = add_indicators(history).iloc[-1]["stoch_rsi_d"]
+    return signal
+
+
+def is_within_market_scan_window(current_time=None):
+    if current_time is None:
+        current_time = datetime.now(IST)
+    elif current_time.tzinfo is None:
+        current_time = current_time.replace(tzinfo=IST)
+
+    if current_time.weekday() >= 5:
+        return False
+
+    if current_time.minute != 15:
+        return False
+
+    start_time = datetime.combine(current_time.date(), dt_time(10, 15), tzinfo=IST)
+    end_time = datetime.combine(current_time.date(), dt_time(15, 15), tzinfo=IST)
+    return start_time <= current_time <= end_time
+
+
+def get_market_close_reference_time(now=None):
+    if now is None:
+        now = datetime.now(IST)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=IST)
+    if now.weekday() >= 5:
+        current_day = now.date() - pd.Timedelta(days=(now.weekday() - 4) % 7)
+    else:
+        current_day = now.date()
+    return datetime.combine(current_day, dt_time(15, 15), tzinfo=IST)
+
+
+def select_hourly_snapshot(history, target_time=None):
+    if history.empty:
+        return None
+    if target_time is None:
+        target_time = dt_time(15, 15)
+
+    history = history.copy()
+    history["timestamp_ist"] = history["timestamp"].dt.tz_convert(IST)
+    exact_matches = history[history["timestamp_ist"].dt.time == target_time]
+    if not exact_matches.empty:
+        return exact_matches.sort_values("timestamp_ist").iloc[-1]
+
+    target_datetime = datetime.combine(history["timestamp_ist"].dt.date.iloc[-1], target_time, tzinfo=IST)
+    earlier = history[history["timestamp_ist"] <= target_datetime]
+    if earlier.empty:
+        return None
+    return earlier.sort_values("timestamp_ist").iloc[-1]
+
+
+def signal_from_row(history, symbol, security_id, row):
+    if row is None:
+        return None
+    calculated = add_indicators(history)
+    matches = calculated[calculated["timestamp"] == row["timestamp"]]
+    if matches.empty:
+        return None
+    row = matches.iloc[0]
+
+    signal = evaluate_signal(
+        symbol=symbol,
+        security_id=security_id,
+        timestamp=row["timestamp"],
+        current_price=row["close"],
+        rsi=row["rsi"],
+        stoch_rsi_k=row["stoch_rsi_k"],
+        bb_lower=row["bb_lower"],
+        bb_middle=row["bb_middle"],
+        bb_upper=row["bb_upper"],
+    )
+    if not signal:
+        return None
+
+    if signal["overall_signal"] == "OVERBOUGHT":
+        signal["overall_signal"] = "SELL / OVERBOUGHT"
+    else:
+        signal["overall_signal"] = "BUY / OVERSOLD"
+
+    signal["triggered_conditions"] = "; ".join(signal["triggered_indicators"])
+    signal["date"] = signal["timestamp"].date().isoformat()
+    signal["rsi_condition"] = condition(signal["rsi"], RSI_OVERBOUGHT, RSI_OVERSOLD)
+    signal["stoch_rsi_condition"] = condition(
+        signal["stoch_rsi_k"], STOCH_OVERBOUGHT, STOCH_OVERSOLD
+    )
+    if pd.isna(signal["current_price"]):
+        return None
+    if signal["current_price"] >= signal["bb_upper"]:
+        signal["bollinger_condition"] = "Overbought"
+    elif signal["current_price"] <= signal["bb_lower"]:
+        signal["bollinger_condition"] = "Oversold"
+    else:
+        signal["bollinger_condition"] = "Neutral"
+    signal["stoch_rsi_d"] = row["stoch_rsi_d"]
+    return signal
+
+
+def scan_hourly_market(symbols=""):
+    require_credentials()
+    if not is_within_market_scan_window():
+        raise SystemExit("Hourly market scan is only valid between 10:15 AM and 3:15 PM IST on weekdays.")
+
+    now = datetime.now(IST)
+    end_date = now.date()
+    start_date = (now - pd.Timedelta(days=7)).date()
+
+    session = http_session()
+    stocks = get_optionable_stocks(fetch_instrument_master(session))
+    if symbols.strip():
+        requested = {
+            item.strip().upper()
+            for item in symbols.split(",")
+            if item.strip()
+        }
+        stocks = stocks[stocks["UNDERLYING_SYMBOL"].isin(requested)].copy()
+    if stocks.empty:
+        raise SystemExit("No option-eligible stocks found for the selection.")
+
+    results = []
+    errors = []
+    for _, row in stocks.iterrows():
+        symbol = row["UNDERLYING_SYMBOL"]
+        security_id = row["UNDERLYING_SECURITY_ID"]
+        try:
+            history = fetch_hourly_history(session, security_id, start_date, end_date)
+            if history.empty:
+                continue
+            snapshot = select_hourly_snapshot(history, dt_time(15, 15))
+            if snapshot is None:
+                continue
+            signal = signal_from_row(history, symbol, security_id, snapshot)
+            if signal and signal["overall_signal"] in {"SELL / OVERBOUGHT", "BUY / OVERSOLD"}:
+                results.append(signal)
+        except (requests.RequestException, ValueError, KeyError, TypeError, IndexError) as exc:
+            errors.append({"symbol": symbol, "security_id": security_id, "error": str(exc)})
+        time_module.sleep(REQUEST_DELAY_SECONDS)
+
+    return {"scan_time": now, "results": results, "errors": errors}
+
+
+def run_after_hours_summary(symbols=""):
+    require_credentials()
+    now = datetime.now(IST)
+    if now.weekday() >= 5:
+        daily_date = now.date() - pd.Timedelta(days=(now.weekday() - 4) % 7)
+    else:
+        daily_date = now.date()
+
+    if now.weekday() < 5 and now.time() >= dt_time(15, 15):
+        daily_end = daily_date
+    else:
+        daily_end = daily_date - pd.Timedelta(days=1)
+
+    session = http_session()
+    stocks = get_optionable_stocks(fetch_instrument_master(session))
+    if symbols.strip():
+        requested = {
+            item.strip().upper()
+            for item in symbols.split(",")
+            if item.strip()
+        }
+        stocks = stocks[stocks["UNDERLYING_SYMBOL"].isin(requested)].copy()
+    if stocks.empty:
+        raise SystemExit("No option-eligible stocks found for the selection.")
+
+    start_date = (pd.Timestamp(daily_end) - pd.Timedelta(days=DEFAULT_HISTORY_DAYS)).date()
+
+    daily_results = []
+    hourly_results = []
+    errors = []
+
+    for _, row in stocks.iterrows():
+        symbol = row["UNDERLYING_SYMBOL"]
+        security_id = row["UNDERLYING_SECURITY_ID"]
+        try:
+            daily_history = fetch_daily_history(session, security_id, start_date, daily_end)
+            daily_signal = scan_latest(daily_history, symbol, security_id)
+            if daily_signal:
+                daily_results.append(daily_signal)
+
+            hourly_history = fetch_hourly_history(
+                session,
+                security_id,
+                (pd.Timestamp(daily_end) - pd.Timedelta(days=7)).date(),
+                daily_end,
+            )
+            if hourly_history.empty:
+                continue
+            hourly_snapshot = select_hourly_snapshot(hourly_history, dt_time(15, 15))
+            if hourly_snapshot is None:
+                continue
+            hourly_signal = signal_from_row(hourly_history, symbol, security_id, hourly_snapshot)
+            if hourly_signal:
+                hourly_results.append(hourly_signal)
+        except (requests.RequestException, ValueError, KeyError, TypeError, IndexError) as exc:
+            errors.append({"symbol": symbol, "security_id": security_id, "error": str(exc)})
+        time_module.sleep(REQUEST_DELAY_SECONDS)
+
+    print("\n=== DAILY TIMEFRAME RESULTS ===")
+    if daily_results:
+        daily_results.sort(key=lambda item: (item["overall_signal"], item["symbol"]))
+        print(pd.DataFrame(daily_results).to_string(index=False))
+    else:
+        print("No overbought/oversold stocks found on the daily timeframe.")
+
+    print("\n=== HOURLY TIMEFRAME RESULTS (3:15 PM IST) ===")
+    if hourly_results:
+        hourly_results.sort(key=lambda item: (item["overall_signal"], item["symbol"]))
+        print(pd.DataFrame(hourly_results).to_string(index=False))
+    else:
+        print("No overbought/oversold stocks found at 3:15 PM on the 1-hour timeframe.")
+
+    if errors:
+        print("\nErrors:")
+        for error in errors:
+            print(f"- {error['symbol']} ({error['security_id']}): {error['error']}")
+
+    return {"daily": daily_results, "hourly": hourly_results, "errors": errors}
 
 
 def format_value(value, decimals=2):
@@ -329,6 +618,132 @@ def build_email(results, errors, end_date):
             f"{item['symbol']} ({item['security_id']}): {item['error']}"
             for item in errors
         )
+
+    html = f"""<!doctype html>
+<html><head><meta charset="utf-8"><style>
+body {{ font-family: Arial, sans-serif; color: #202124; }}
+table {{ border-collapse: collapse; width: 100%; }}
+th, td {{ border: 1px solid #dadce0; padding: 8px; text-align: left; vertical-align: top; }}
+th {{ background: #f1f3f4; }}
+.buy {{ color: #137333; font-weight: bold; }}
+.sell {{ color: #c5221f; font-weight: bold; }}
+</style></head><body>
+<h1>Daily options stock signals</h1>
+<p>Completed daily candle through <strong>{end_date}</strong>. Scanned stocks with listed NSE stock options.</p>
+{table}
+{error_section}
+</body></html>"""
+    plain = (
+        f"Daily options stock signals for {end_date}\n\n"
+        f"{plain_rows}{plain_errors}"
+    )
+    return subject, plain, html
+
+
+def build_after_hours_email(daily_results, hourly_results, errors, end_date):
+    """Build a combined post-market summary for daily and 3:15 PM hourly scans."""
+
+    def format_section(title, items):
+        if not items:
+            return (
+                f"<h2>{title}</h2><p>No overbought/oversold stocks found.</p>",
+                f"{title}\nNo overbought/oversold stocks found.\n",
+            )
+
+        rows = []
+        for item in items:
+            signal_class = "sell" if item["overall_signal"].startswith("SELL") else "buy"
+            rows.append(
+                "<tr>"
+                f"<td><strong>{item['symbol']}</strong></td>"
+                f"<td class='{signal_class}'>{item['overall_signal']}</td>"
+                f"<td>{format_value(item['current_price'])}</td>"
+                f"<td>{format_value(item['rsi'])} ({item['rsi_condition']})</td>"
+                f"<td>{format_value(item['stoch_rsi_k'])} ({item['stoch_rsi_condition']})</td>"
+                f"<td>{item['bollinger_condition']}<br>Lower: {format_value(item['bb_lower'])}, Upper: {format_value(item['bb_upper'])}</td>"
+                f"<td>{item['triggered_conditions']}</td>"
+                "</tr>"
+            )
+
+        table = (
+            "<table><thead><tr>"
+            "<th>Symbol</th><th>Signal</th><th>Price</th><th>RSI</th>"
+            "<th>Stoch RSI %K</th><th>Bollinger Bands</th><th>Triggered conditions</th>"
+            "</tr></thead><tbody>"
+            + "".join(rows)
+            + "</tbody></table>"
+        )
+        plain_rows = "\n".join(
+            f"{item['symbol']}: {item['overall_signal']} | price {format_value(item['current_price'])} | "
+            f"RSI {format_value(item['rsi'])} ({item['rsi_condition']}) | "
+            f"Stoch RSI {format_value(item['stoch_rsi_k'])} ({item['stoch_rsi_condition']}) | "
+            f"Bollinger {item['bollinger_condition']} | {item['triggered_conditions']}"
+            for item in items
+        )
+        return f"<h2>{title}</h2>{table}", f"{title}\n{plain_rows}\n"
+
+    daily_html, daily_plain = format_section("Daily Timeframe", daily_results)
+    hourly_html, hourly_plain = format_section("3:15 PM Hourly Timeframe", hourly_results)
+
+    error_section = ""
+    plain_errors = ""
+    if errors:
+        error_items = "".join(
+            f"<li>{item['symbol']} ({item['security_id']}): {item['error']}</li>"
+            for item in errors
+        )
+        error_section = f"<h2>Scan errors ({len(errors)})</h2><ul>{error_items}</ul>"
+        plain_errors = "\n\nScan errors:\n" + "\n".join(
+            f"{item['symbol']} ({item['security_id']}): {item['error']}"
+            for item in errors
+        )
+
+    html = f"""<!doctype html>
+<html><head><meta charset="utf-8"><style>
+body {{ font-family: Arial, sans-serif; color: #202124; }}
+table {{ border-collapse: collapse; width: 100%; }}
+th, td {{ border: 1px solid #dadce0; padding: 8px; text-align: left; vertical-align: top; }}
+th {{ background: #f1f3f4; }}
+.buy {{ color: #137333; font-weight: bold; }}
+.sell {{ color: #c5221f; font-weight: bold; }}
+</style></head><body>
+<h1>Post-market stock scan summary</h1>
+<p>Summary for <strong>{end_date}</strong> using the daily timeframe and the 3:15 PM IST 1-hour candle.</p>
+{daily_html}
+{hourly_html}
+{error_section}
+</body></html>"""
+    plain = (
+        f"Post-market stock scan summary for {end_date}\n\n"
+        f"{daily_plain}\n{hourly_plain}{plain_errors}"
+    )
+    subject = f"Post-market stock scan summary - {end_date}"
+    return subject, plain, html
+
+
+def send_after_hours_summary_email(daily_results, hourly_results, errors, end_date):
+    subject, plain, html = build_after_hours_email(daily_results, hourly_results, errors, end_date)
+    message = EmailMessage()
+    message["From"] = GMAIL_ADDRESS
+    message["To"] = ALERT_EMAIL_TO
+    message["Subject"] = subject
+    message.set_content(plain)
+    message.add_alternative(html, subtype="html")
+
+    with smtplib.SMTP_SSL(GMAIL_SMTP_HOST, GMAIL_SMTP_PORT, timeout=60) as smtp:
+        smtp.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
+        smtp.send_message(message)
+
+
+def email_after_hours_summary(symbols=""):
+    summary = run_after_hours_summary(symbols=symbols)
+    send_after_hours_summary_email(
+        summary["daily"],
+        summary["hourly"],
+        summary["errors"],
+        datetime.now(IST).date().isoformat(),
+    )
+    return summary
 
     html = f"""<!doctype html>
 <html><head><meta charset="utf-8"><style>
@@ -423,7 +838,7 @@ def run_scan(symbols="", requested_end_date=None, include_today=False):
         except (requests.RequestException, ValueError, KeyError, TypeError, IndexError) as exc:
             print(f"    -> ERROR: {exc}")
             errors.append({"symbol": symbol, "security_id": security_id, "error": str(exc)})
-        time.sleep(REQUEST_DELAY_SECONDS)
+        time_module.sleep(REQUEST_DELAY_SECONDS)
 
     if results:
         results.sort(key=lambda item: (item["overall_signal"], item["symbol"]))
@@ -441,11 +856,14 @@ def run_scan(symbols="", requested_end_date=None, include_today=False):
 
 def main():
     args = parse_args()
-    run_scan(
-        symbols=args.symbols,
-        requested_end_date=args.end_date,
-        include_today=args.include_today,
-    )
+    if args.end_date or args.include_today or args.symbols:
+        run_scan(
+            symbols=args.symbols,
+            requested_end_date=args.end_date,
+            include_today=args.include_today,
+        )
+        return
+    run_after_hours_summary(symbols=args.symbols)
 
 
 if __name__ == "__main__":
