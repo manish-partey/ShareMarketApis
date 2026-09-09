@@ -1,14 +1,13 @@
+import json
 import logging
-from datetime import datetime
 
 import azure.functions as func
 
 from dhan_daily_overbought_oversold_scanner import (
-    IST,
     email_after_hours_summary,
-    is_within_market_scan_window,
+    is_trading_day,
     scan_hourly_market,
-    send_after_hours_summary_email,
+    send_email,
 )
 
 
@@ -22,19 +21,23 @@ app = func.FunctionApp()
     use_monitor=True,
 )
 def hourly_option_overbought_oversold(timer: func.TimerRequest) -> None:
-    """Run the hourly option-eligible stock scan during Indian market hours."""
+    """Scan the latest completed hourly candle and email the results."""
     if timer.past_due:
         logging.warning("Hourly option scanner timer is past due")
 
-    current_time = datetime.now(IST)
-    if not is_within_market_scan_window(current_time):
-        logging.info("Skipping hourly option scan outside the Indian market window")
+    logging.info("Starting hourly option scanner")
+    if not is_trading_day():
+        logging.info("Skipping hourly option scan on a weekend or NSE holiday")
         return
 
-    logging.info("Starting hourly option scanner for Indian market")
     result = scan_hourly_market()
+    send_email(
+        result["results"],
+        result["errors"],
+        result["scan_time"].date().isoformat(),
+    )
     logging.info(
-        "Hourly option scan completed with %s signal(s) and %s error(s)",
+        "Hourly option scan and email completed with %s signal(s) and %s error(s)",
         len(result["results"]),
         len(result["errors"]),
     )
@@ -46,8 +49,9 @@ def manual_post_market_scan(req: func.HttpRequest) -> func.HttpResponse:
     try:
         summary = email_after_hours_summary()
         return func.HttpResponse(
-            "Post-market scan email sent successfully.",
+            json.dumps(summary, default=str),
             status_code=200,
+            mimetype="application/json",
         )
     except SystemExit as exc:
         logging.exception("Post-market manual scan failed")

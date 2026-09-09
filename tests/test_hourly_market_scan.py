@@ -1,9 +1,12 @@
 from datetime import datetime
 
+import pandas as pd
+
 from dhan_daily_overbought_oversold_scanner import (
     build_after_hours_email,
     evaluate_signal,
     is_within_market_scan_window,
+    select_latest_completed_hourly_snapshot,
 )
 
 
@@ -18,6 +21,23 @@ def test_market_scan_window_rejects_weekend_and_closed_market_hours():
 
     closed_time = datetime(2026, 9, 8, 9, 0)
     assert is_within_market_scan_window(closed_time) is False
+
+
+def test_latest_completed_hourly_snapshot_excludes_incomplete_candle():
+    history = pd.DataFrame({
+        "timestamp": pd.to_datetime([
+            "2026-09-09T04:45:00Z",
+            "2026-09-09T05:45:00Z",
+            "2026-09-09T06:45:00Z",
+        ], utc=True),
+    })
+
+    row = select_latest_completed_hourly_snapshot(
+        history,
+        datetime(2026, 9, 9, 12, 0),
+    )
+
+    assert row["timestamp"].isoformat() == "2026-09-09T05:45:00+00:00"
 
 
 def test_evaluate_signal_flags_any_triggered_indicator_for_hourly_scan():

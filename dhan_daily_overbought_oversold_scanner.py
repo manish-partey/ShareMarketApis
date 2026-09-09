@@ -48,6 +48,11 @@ DHAN_CLIENT_ID = os.getenv("DHAN_CLIENT_ID")
 GMAIL_ADDRESS = os.getenv("GMAIL_ADDRESS")
 GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
 ALERT_EMAIL_TO = os.getenv("ALERT_EMAIL_TO")
+NSE_HOLIDAYS = {
+    item.strip()
+    for item in os.getenv("NSE_HOLIDAYS", "").split(",")
+    if item.strip()
+}
 
 
 def require_credentials():
@@ -224,9 +229,9 @@ def add_indicators(history):
 def condition(value, overbought, oversold):
     if pd.isna(value):
         return "Unavailable"
-    if value >= overbought:
+    if value > overbought:
         return "Overbought"
-    if value <= oversold:
+    if value < oversold:
         return "Oversold"
     return "Neutral"
 
@@ -247,26 +252,26 @@ def evaluate_signal(
     oversold_count = 0
 
     if pd.notna(rsi):
-        if rsi >= RSI_OVERBOUGHT:
+        if rsi > RSI_OVERBOUGHT:
             triggered_indicators.append("RSI")
             overbought_count += 1
-        elif rsi <= RSI_OVERSOLD:
+        elif rsi < RSI_OVERSOLD:
             triggered_indicators.append("RSI")
             oversold_count += 1
 
     if pd.notna(stoch_rsi_k):
-        if stoch_rsi_k >= STOCH_OVERBOUGHT:
+        if stoch_rsi_k > STOCH_OVERBOUGHT:
             triggered_indicators.append("Stochastic RSI")
             overbought_count += 1
-        elif stoch_rsi_k <= STOCH_OVERSOLD:
+        elif stoch_rsi_k < STOCH_OVERSOLD:
             triggered_indicators.append("Stochastic RSI")
             oversold_count += 1
 
     if pd.notna(current_price):
-        if current_price >= bb_upper:
+        if current_price > bb_upper:
             triggered_indicators.append("Bollinger Bands")
             overbought_count += 1
-        elif current_price <= bb_lower:
+        elif current_price < bb_lower:
             triggered_indicators.append("Bollinger Bands")
             oversold_count += 1
 
@@ -345,16 +350,25 @@ def scan_latest(history, symbol, security_id):
     return signal
 
 
+def is_trading_day(current_time=None):
+    if current_time is None:
+        current_time = datetime.now(IST)
+    elif current_time.tzinfo is None:
+        current_time = current_time.replace(tzinfo=IST)
+
+    return (
+        current_time.weekday() < 5
+        and current_time.date().isoformat() not in NSE_HOLIDAYS
+    )
+
+
 def is_within_market_scan_window(current_time=None):
     if current_time is None:
         current_time = datetime.now(IST)
     elif current_time.tzinfo is None:
         current_time = current_time.replace(tzinfo=IST)
 
-    if current_time.weekday() >= 5:
-        return False
-
-    if current_time.minute != 15:
+    if not is_trading_day(current_time):
         return False
 
     start_time = datetime.combine(current_time.date(), dt_time(10, 15), tzinfo=IST)
@@ -374,6 +388,13 @@ def get_market_close_reference_time(now=None):
     return datetime.combine(current_day, dt_time(15, 15), tzinfo=IST)
 
 
+def previous_trading_date(current_date):
+    candidate = current_date - pd.Timedelta(days=1)
+    while candidate.weekday() >= 5 or candidate.isoformat() in NSE_HOLIDAYS:
+        candidate -= pd.Timedelta(days=1)
+    return candidate
+
+
 def select_hourly_snapshot(history, target_time=None):
     if history.empty:
         return None
@@ -391,6 +412,25 @@ def select_hourly_snapshot(history, target_time=None):
     if earlier.empty:
         return None
     return earlier.sort_values("timestamp_ist").iloc[-1]
+
+
+def select_latest_completed_hourly_snapshot(history, now=None):
+    """Return the latest candle whose timestamp is not later than now."""
+    if history.empty:
+        return None
+    if now is None:
+        now = datetime.now(IST)
+    elif now.tzinfo is None:
+        now = now.replace(tzinfo=IST)
+    else:
+        now = now.astimezone(IST)
+
+    history = history.copy()
+    history["timestamp_ist"] = history["timestamp"].dt.tz_convert(IST)
+    completed = history[history["timestamp_ist"] <= now]
+    if completed.empty:
+        return None
+    return completed.sort_values("timestamp_ist").iloc[-1]
 
 
 def signal_from_row(history, symbol, security_id, row):
@@ -441,9 +481,6 @@ def signal_from_row(history, symbol, security_id, row):
 
 def scan_hourly_market(symbols=""):
     require_credentials()
-    if not is_within_market_scan_window():
-        raise SystemExit("Hourly market scan is only valid between 10:15 AM and 3:15 PM IST on weekdays.")
-
     now = datetime.now(IST)
     end_date = now.date()
     start_date = (now - pd.Timedelta(days=7)).date()
@@ -469,7 +506,7 @@ def scan_hourly_market(symbols=""):
             history = fetch_hourly_history(session, security_id, start_date, end_date)
             if history.empty:
                 continue
-            snapshot = select_hourly_snapshot(history, dt_time(15, 15))
+            snapshot = select_latest_completed_hourly_snapshot(history, now)
             if snapshot is None:
                 continue
             signal = signal_from_row(history, symbol, security_id, snapshot)
@@ -485,15 +522,10 @@ def scan_hourly_market(symbols=""):
 def run_after_hours_summary(symbols=""):
     require_credentials()
     now = datetime.now(IST)
-    if now.weekday() >= 5:
-        daily_date = now.date() - pd.Timedelta(days=(now.weekday() - 4) % 7)
+    if is_trading_day(now) and now.time() >= dt_time(15, 15):
+        daily_end = now.date()
     else:
-        daily_date = now.date()
-
-    if now.weekday() < 5 and now.time() >= dt_time(15, 15):
-        daily_end = daily_date
-    else:
-        daily_end = daily_date - pd.Timedelta(days=1)
+        daily_end = previous_trading_date(now.date())
 
     session = http_session()
     stocks = get_optionable_stocks(fetch_instrument_master(session))
@@ -585,12 +617,13 @@ def build_email(results, errors, end_date):
                 f"<td>{result['bollinger_condition']}<br>Lower: {format_value(result['bb_lower'])}, "
                 f"Upper: {format_value(result['bb_upper'])}</td>"
                 f"<td>{result['triggered_conditions']}</td>"
+                f"<td>{result.get('timestamp', '-')}</td>"
                 "</tr>"
             )
         table = (
             "<table><thead><tr>"
             "<th>Symbol</th><th>Signal</th><th>Price</th><th>RSI</th>"
-            "<th>Stoch RSI %K</th><th>Bollinger Bands</th><th>Triggered conditions</th>"
+            "<th>Stoch RSI %K</th><th>Bollinger Bands</th><th>Triggered conditions</th><th>Candle time</th>"
             "</tr></thead><tbody>"
             + "".join(rows)
             + "</tbody></table>"
@@ -599,7 +632,8 @@ def build_email(results, errors, end_date):
             f"{item['symbol']}: {item['overall_signal']} | price {format_value(item['current_price'])} | "
             f"RSI {format_value(item['rsi'])} ({item['rsi_condition']}) | "
             f"Stoch RSI {format_value(item['stoch_rsi_k'])} ({item['stoch_rsi_condition']}) | "
-            f"Bollinger {item['bollinger_condition']} | {item['triggered_conditions']}"
+            f"Bollinger {item['bollinger_condition']} | {item['triggered_conditions']} | "
+            f"candle {item.get('timestamp', '-')}"
             for item in results
         )
     else:
@@ -662,13 +696,14 @@ def build_after_hours_email(daily_results, hourly_results, errors, end_date):
                 f"<td>{format_value(item['stoch_rsi_k'])} ({item['stoch_rsi_condition']})</td>"
                 f"<td>{item['bollinger_condition']}<br>Lower: {format_value(item['bb_lower'])}, Upper: {format_value(item['bb_upper'])}</td>"
                 f"<td>{item['triggered_conditions']}</td>"
+                f"<td>{item.get('timestamp', '-')}</td>"
                 "</tr>"
             )
 
         table = (
             "<table><thead><tr>"
             "<th>Symbol</th><th>Signal</th><th>Price</th><th>RSI</th>"
-            "<th>Stoch RSI %K</th><th>Bollinger Bands</th><th>Triggered conditions</th>"
+            "<th>Stoch RSI %K</th><th>Bollinger Bands</th><th>Triggered conditions</th><th>Candle time</th>"
             "</tr></thead><tbody>"
             + "".join(rows)
             + "</tbody></table>"
@@ -744,26 +779,6 @@ def email_after_hours_summary(symbols=""):
         datetime.now(IST).date().isoformat(),
     )
     return summary
-
-    html = f"""<!doctype html>
-<html><head><meta charset="utf-8"><style>
-body {{ font-family: Arial, sans-serif; color: #202124; }}
-table {{ border-collapse: collapse; width: 100%; }}
-th, td {{ border: 1px solid #dadce0; padding: 8px; text-align: left; vertical-align: top; }}
-th {{ background: #f1f3f4; }}
-.buy {{ color: #137333; font-weight: bold; }}
-.sell {{ color: #c5221f; font-weight: bold; }}
-</style></head><body>
-<h1>Daily options stock signals</h1>
-<p>Completed daily candle through <strong>{end_date}</strong>. Scanned stocks with listed NSE stock options.</p>
-{table}
-{error_section}
-</body></html>"""
-    plain = (
-        f"Daily options stock signals for {end_date}\n\n"
-        f"{plain_rows}{plain_errors}"
-    )
-    return subject, plain, html
 
 
 def send_email(results, errors, end_date):
